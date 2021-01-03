@@ -1,0 +1,906 @@
+#!/usr/bin/python3
+
+# zim-import-tomboy
+# Copyright 2021 Michael McLean
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+
+from __future__ import print_function
+import glob
+import os
+import os.path
+import re
+import sys
+
+import lxml.etree as ET
+
+from dateutil.parser import parse as parse_date
+from fnmatch import fnmatch
+from itertools import count
+from optparse import OptionParser
+
+
+'''
+Inspiration drawn from the tzim script [1] and a gist by scribu [2]
+
+[1] https://github.com/osamuaoki/tzim
+[2] https://gist.github.com/scribu/7442170
+'''
+
+
+TOMBOY_CAT_PREFIX = 'system:notebook:'
+
+TAGTYPES = [
+        'note-content',
+        'bold', 'italic', 'strikethrough', 'highlight', 'monospace',
+        'link:url', 'link:internal', 'link:broken',
+        'list', 'list-item',
+        # the following are not supported in Zim
+        'underline',
+        'datetime',  # Tomboy extension
+        'link:bugzilla',  # Tomboy extension
+        'size:small', 'size:large', 'size:huge',
+        ]
+
+# The following tags will be merged if adjacent
+MERGE_TAGS = {'bold', 'italic', 'strikethrough', 'highlight', 'monospace',
+              'underline', 'size:small', 'size:large', 'size:huge'}
+
+
+def el(name):
+    parts = name.split(':')
+    ns = '/'.join(parts[:-1])
+    url = 'http://beatniksoftware.com/tomboy'
+    if ns:
+        url = "%s/%s" % (url, ns)
+    name = parts[-1]
+    return '{%s}%s' % (url, name)
+
+
+def tag_to_ttype(tag):
+    for ttype in TAGTYPES:
+        if tag == el(ttype):
+            return ttype
+    # else
+    raise ValueError('Unknown tag: %s' % tag.tag)
+
+
+class MarkupSegment:
+
+    def __init__(self, tag, contents, parent=None):
+        self.tag = tag
+        self.contents = contents
+        self.parent = parent
+
+    @classmethod
+    def from_element(cls, element, parent=None):
+        contents = []
+        self = cls(MarkupTag(element), contents, parent)
+
+        # first the text
+        children = list(element)
+        # don't include empty segment if all we contain is subtags
+        if element.text or not children:
+            text = cls(MarkupTag('text'), [element.text or ''], self)
+            contents.append(text)
+
+        # then the children, text and tails
+        for child in children:
+            subseg = cls.from_element(child, self)
+            contents.append(subseg)
+
+            if child.tail:
+                tail = cls(MarkupTag('text'), [child.tail], self)
+                contents.append(tail)
+
+        return self
+
+    def __str__(self):
+        if self.tag:
+            name = self.tag.ttype
+        else:
+            name = 'text'
+        return "%s(%r)" % (name, self.contents)
+
+    def __repr__(self):
+        return "MarkupSegment(%r, %r)" % (self.tag, self.contents)
+
+    def pprint(self, depth=0):
+        indent = '    ' * depth
+        print("%s%s(%r" % (indent, self.tag.ttype, self.tag.attrib))
+        for child in self.contents:
+            if isinstance(child, str):
+                print(indent + '    ' + repr(child))
+            else:
+                child.pprint(depth+1)
+        print("%s)  # end %s" % (indent, self.tag.ttype))
+
+    def merge_tags(self):
+        """Recursively merge adjacent identical tags
+
+        I.e. two adjacent bold segments become one bold segment
+        We do this to simplify the eventual Zim markup
+        """
+        if self.tag.ttype == 'text':
+            return self
+        for seg in self.contents:
+            seg.merge_tags()
+        last = None
+        new_contents = []
+        merged = False
+        for seg in self.contents:
+            if last and last.tag.ttype in MERGE_TAGS and last.tag == seg.tag:
+                # move segment contents into last and drop seg
+                last.contents.extend(seg.contents)
+                for c in seg.contents:
+                    # fix parent
+                    c.parent = last
+                merged = True
+            else:
+                new_contents.append(seg)
+                last = seg
+        self.contents[:] = new_contents
+
+        if merged:
+            # merging can unearth further redundancy
+            self.merge_tags()
+
+    def convert_monospace(self):
+        """Convert monospace to verbatim if appropriate"""
+        assert self.tag.ttype == 'note-content'
+
+        # verbatim is the only multiline markup that zim understands
+        # but it doesn't work with other markup.
+        # we convert monospace to verbatim only in narrow cases, otherwise
+        # we leave it alone.
+
+        last = None
+        for child in self.contents:
+            if last and child.tag.ttype == 'monospace':
+                child._convert_monospace(last)
+            last = child
+
+    def _convert_monospace(self, last):
+        # is our content ok?
+        found_nl = False
+        for child in self.contents:
+            # is there anything besides plain text?
+            if child.tag.ttype != 'text':
+                return
+            # otherwise child is a text segment
+            for c in child.contents:
+                if '\n' in c:
+                    found_nl = True
+                    break
+        if not found_nl:
+            return
+
+        if last.tag.ttype == 'list':
+            self.tag = MarkupTag('verbatim')
+        else:
+            # drill down to the last part, which should be a text segment
+            seg = next(last.iter_contents_reverse())
+            assert seg.tag.ttype == 'text'
+            if seg.contents and seg.contents[-1].endswith('\n'):
+                self.tag = MarkupTag('verbatim')
+
+    def convert_headings(self):
+        """Convert some size tags to headings if appropriate
+
+        This should only be run after split_lines()
+        """
+        assert self.tag.ttype == 'note-content'
+
+        # Zim doesn't have size markup, but it does have headings, and many
+        # uses of size:large and size:huge in Tomboy are basically headings
+
+        # we're looking for size segments that span a full line
+        # TODO: handle case where we're also wrapped in bold or similar
+        for line in self.iter_lines():
+            # is this line a single segment?
+            if len(line) != 1:
+                continue
+            this = line[0]
+            if this.tag.ttype == 'size:huge':
+                level = 2
+            elif this.tag.ttype == 'size:large':
+                level = 3
+            else:
+                continue
+            # ok, let's make it a heading
+            this.tag = MarkupTag('heading', {'level': level})
+
+    NEWLINES = u'\n\r\v\f\x1c\x1d\x85\u2028\u2029'
+
+    def _fixline(self, line):
+        """Replace odd line endings with newlines"""
+        orig = len(line)
+        line = line.rstrip(self.NEWLINES)
+        if len(line) < orig:
+            line += '\n'
+        return line
+
+    def split_lines(self):
+        """Split content by lines
+
+        At the top level (note-content), we return a new segment with the content split
+        by lines.
+        At other levels, we return a list of segments representing the split content.
+
+        We do this because Zim's markup is almost entirely limited to a single line.
+        """
+        ttype = self.tag.ttype
+        handler = getattr(self, 'split_lines_%s' % ttype.replace('-', '_'), None)
+        if handler:
+            ret = handler()
+            if ret is not None:
+                return ret
+        # otherwise
+        return self.split_lines_default()
+
+    def split_lines_text(self):
+        # This lowest level of markup is where we perform the key split
+        # We return a list of text and newline segments
+        ret = []
+        lines = ''.join(self.contents).splitlines(keepends=True) or ['']
+        # contents is a list of strings, and there could be more than one in principle
+        for line in lines:
+            stripped = line.rstrip(self.NEWLINES)
+            seg = MarkupSegment(self.tag.copy(), [stripped], self.parent)
+            ret.append(seg)
+            if len(stripped) < len(line):
+                # newline segments propagate up in the split
+                nl = MarkupSegment(MarkupTag('newline'), ['\n'], None)
+                ret.append(nl)
+        return ret
+
+    def split_lines_newline(self):
+        # should never happen
+        raise ValueError('found newline tag while splitting')
+
+    def split_lines_note_content(self):
+        new_contents = []
+        for child in self.contents:
+            parts = child.split_lines()
+            new_contents.extend(parts)
+        self.contents = new_contents
+        # we're at the top, so just return ourselves
+        return self
+
+    def split_lines_list(self):
+        # we don't need to propagate the split up
+        new_contents = []
+        for child in self.contents:
+            parts = child.split_lines()
+            parts = [p for p in parts if p.tag.ttype != 'newline']
+            new_contents.extend(parts)
+        self.contents = new_contents
+        return [self]
+
+    def split_lines_verbatim(self):
+        # we don't split verbatim segments
+        return [self]
+
+    def split_lines_default(self):
+        # for other markup, the splits propagate up and each part of the split gets
+        # marked up separately. I.e. a bold segment that contained two lines of text
+        # becomes two bold segments, one for each line.
+
+        ret = []  # the list of split segments we will return
+        new_contents = []  # contents for the split segment we are working on
+
+        def add_segment():
+            nonlocal new_contents
+            seg = MarkupSegment(self.tag.copy(), new_contents, self.parent)
+            for c in new_contents:
+                c.parent = seg
+            ret.append(seg)
+            new_contents = []
+
+        for child in self.contents:
+            for part in child.split_lines():
+                if part.tag.ttype == 'newline':
+                    # we expect these between each part
+                    add_segment()
+                    ret.append(part)
+                    # note how the newline segment propagates up
+                else:
+                    new_contents.append(part)
+        if new_contents:
+            add_segment()
+        return ret
+
+    def prune_empty(self):
+        if self.tag.ttype in ('newline', 'list-item'):
+            return
+        if self.tag.ttype == 'text':
+            self.contents = [c for c in self.contents if c]
+            return
+        for child in self.contents:
+            child.prune_empty()
+        self.contents = [c for c in self.contents if c.contents]
+
+    def format_title(self, title):
+        """Fix the title formatting
+
+        We expect to find the title on the first line, possibly with markup.
+        """
+        # this should only be called after split_lines()
+        assert self.tag.ttype == 'note-content'
+        # split the title contents away from the top contents
+        top_contents = []
+        title_contents = []
+        dest = title_contents
+        for child in self.contents:
+            if child.tag.ttype in ('newline', 'list'):
+                # put the rest in the top
+                dest = top_contents
+            dest.append(child)
+
+        found = False
+        if title_contents:
+            title_seg = MarkupSegment(MarkupTag('heading', {'level': 1}), title_contents, self)
+            for c in title_contents:
+                c.parent = title_seg
+            if title_seg.text().strip() == title:
+                found = True
+
+        if found:
+            top_contents.insert(0, title_seg)
+            self.contents = top_contents
+        else:
+            # we'll just make a new title
+            title_seg = MarkupSegment(MarkupTag('heading', {'level': 1}), title_contents, self)
+            self.contents.insert(0, title_seg)
+
+    def markup(self):
+        return ''.join(self.iter_markup())
+
+    def iter_markup(self):
+        # This is kind of an odd approach
+        state = {'line_start': True}
+        for func in self._iter_for_markup():
+            part = func(state)
+            if part is not None:
+                yield part
+                state['line_start'] = (part[-1:] == '\n')
+
+    def iter_stack(self):
+        pos = self.parent
+        while pos:
+            yield pos.tag
+            pos = pos.parent
+
+    def _iter_for_markup(self):
+        yield self.pre_markup
+        for child in self.contents:
+            if not isinstance(child, MarkupSegment):
+                continue
+            for func in child._iter_for_markup():
+                yield func
+        yield self.post_markup
+
+    PRE_MARKUP = {
+            'bold': '**',
+            'italic': '//',
+            'strikethrough': '~~',
+            'highlight': '__',
+            'datetime': '//[',
+            }
+
+    POST_MARKUP = {
+            'bold': '**',
+            'italic': '//',
+            'strikethrough': '~~',
+            'highlight': '__',
+            # Zim is weird about highlight/underline
+            'datetime': ']//',
+            }
+
+    def pre_markup(self, state):
+        ttype = self.tag.ttype
+        if ttype == 'text':
+            return self.escape_text()
+        elif ttype == 'newline':
+            return '\n'
+        elif ttype in self.PRE_MARKUP:
+            return self.PRE_MARKUP[ttype]
+        elif ttype == 'monospace':
+            return "''"
+        elif ttype == 'verbatim':
+            if state['line_start']:
+                return "'''\n"
+            else:
+                return "\n'''\n"
+        elif ttype == 'heading':
+            return '=' * max(min(7 - self.tag.attrib['level'], 6), 2) + ' '
+        elif ttype == 'link:url':
+            # return '[['
+            # Tomboy makes a bunch of wrong automatic links
+            # Let's just leave them plain
+            return None
+        elif ttype == 'link:bugzilla':
+            uri = self.tag.attrib['uri']
+            # '[[%s|bz#%s]]' % (uri, text)
+            return '[[%s|bz#' % uri
+        elif ttype.startswith('link:'):
+            # link:internal or link:broken
+            if self.tag.attrib.get('unlink'):
+                # omit markup for broken link
+                return None
+            # XXX - maybe markup is not the time to fix links
+            target = self.tag.attrib.get('target')  # set by fix_links
+            text = ''.join([c.markup() for c in self.contents])
+            if target and text != target:
+                # '[[%s|%s]]' % (target, text)
+                return '[[%s|' % target
+            else:
+                return '[['
+        elif ttype == 'list-item':
+            if not state['line_start']:
+                raise Exception('list item not at start of line')
+            if len(self.contents) == 1 and self.contents[0].tag.ttype == 'list':
+                # child will handle the markup
+                return None
+            # otherwise
+            depth = len([t for t in self.iter_stack() if t.ttype == 'list'])
+            return '\t' * (depth - 1) + '* '
+
+    def post_markup(self, state):
+        ttype = self.tag.ttype
+        if ttype in self.POST_MARKUP:
+            return self.POST_MARKUP[ttype]
+        elif ttype == 'monospace':
+            return "''"
+        elif ttype == 'verbatim':
+            if state['line_start']:
+                return "'''\n"
+            else:
+                return "\n'''\n"
+        elif ttype == 'heading':
+            return ' ' + '=' * max(min(7 - self.tag.attrib['level'], 6), 2)
+        elif ttype == 'link:url':
+            # return ']]'
+            return None
+        elif ttype == 'link:bugzilla':
+            return ']]'
+        elif ttype.startswith('link:'):
+            # link:internal or link:broken
+            if self.tag.attrib.get('unlink'):
+                # omit markup for broken link
+                return None
+            return ']]'
+        elif ttype == 'list-item':
+            if len(self.contents) == 1 and self.contents[0].tag.ttype == 'list':
+                # child will handle the markup
+                return None
+            # otherwise
+            return '\n'
+            # note that list items get their own newline
+
+    ESCAPE_SUBS = [
+            [re.compile(r'[*][*]'), '\u200b*\u200b*\u200b'],
+            [re.compile(r'(?<!:)//'), '\u200b/\u200b/\u200b'],  # avoid matching the // in urls
+            [re.compile(r'~~'), '\u200b~\u200b~\u200b'],
+            [re.compile(r'__'), '\u200b_\u200b_\u200b'],
+            [re.compile(r'\[\['), '\u200b[\u200b[\u200b'],
+            [re.compile(r'\]\]'), '\u200b]\u200b]\u200b'],
+            [re.compile(r"''"), "\u200b'\u200b'\u200b"],
+            ]
+
+    def escape_text(self):
+        # Should only be called on text segments
+        text = ''.join(self.contents)
+        if self.parent.tag.ttype == 'verbatim':
+            # no escapes in a verbatim block
+            return text
+        # There is no perfect way to escape markup in Zim
+        # We're inserting zero width spaces because it works the most systematically.
+        for prog, esc in self.ESCAPE_SUBS:
+            text = prog.sub(esc, text)
+        return text
+
+    def iter_contents(self):
+        yield self
+        if self.tag.ttype in ('text', 'newline'):
+            return
+        for child in self.contents:
+            for seg in child.iter_contents():
+                yield seg
+
+    def iter_contents_reverse(self):
+        if self.tag.ttype not in ('text', 'newline'):
+            for child in reversed(self.contents):
+                for seg in child.iter_contents_reverse():
+                    yield seg
+        yield self
+
+    def iter_lines(self):
+        """Iterate over lines
+
+        This should be run from top level, after running split_lines().
+        Verbatim is treated as one line.
+        """
+        assert self.tag.ttype == 'note-content'
+        line_parts = []
+        for child in self.contents:
+            if child.tag.ttype == 'newline':
+                yield line_parts
+                line_parts = []
+            elif child.tag.ttype == 'list':
+                yield line_parts
+                line_parts = []
+                for item in child.filter_contents('list-item'):
+                    yield [item]
+            else:
+                line_parts.append(child)
+
+    def check_parents(self):
+        for child in self.contents:
+            if not isinstance(child, MarkupSegment):
+                continue
+            if child.tag.ttype == 'newline':
+                # we don't track parents for these
+                continue
+            if child.parent is not self:
+                raise Exception('broken lineage')
+            child.check_parents()
+
+    def prev(self):
+        """Return content before self in parent, if any"""
+        if not self.parent:
+            return None
+        last = None
+        for sib in self.parent.contents:
+            if sib is self:
+                return last
+            last = sib
+        # should not happen
+        raise Exception('parent does not contain child')
+
+    def filter_contents(self, ttype='*'):
+        for seg in self.iter_contents():
+            if fnmatch(seg.tag.ttype, ttype):
+                yield seg
+
+    def text(self):
+        """Return text with no markup"""
+        def _text():
+            for seg in self.filter_contents(ttype='text'):
+                for part in seg.contents:
+                    yield part
+        return ''.join(_text())
+
+
+class MarkupTag:
+
+    def __init__(self, tag, attrib=None):
+        self.attrib = {}
+        if isinstance(tag, str):
+            self.ttype = tag
+        elif tag is None:
+            self.ttype = 'text'
+        else:
+            self.ttype = tag_to_ttype(tag.tag)
+            self.attrib = dict(tag.attrib)
+            # ^ needed for link:bugzilla tags
+        if attrib is not None:
+            self.attrib = attrib
+
+    def copy(self):
+        return MarkupTag(self.ttype, self.attrib.copy())
+
+    def __eq__(self, other):
+        if not isinstance(other, MarkupTag):
+            return False
+        return self.ttype == other.ttype and self.attrib == other.attrib
+
+    def __str__(self):
+        return self.ttype
+
+    def __repr__(self):
+        return "MarkupTag(%s, %r)" % (self.ttype, self.attrib)
+
+
+class Note:
+
+    def __init__(self, path):
+        self.path = path
+        self.root = ET.parse(path).getroot()
+        self.get_tags()
+        self.get_dates()
+        self.get_title()
+        self.get_content()
+        # TODO: check note version
+
+    def get_tags(self):
+        tags = []
+        category = None
+
+        tagsEl = self.root.find(el('tags'))
+        if tagsEl is not None:
+            for tagEl in tagsEl:
+                tag = tagEl.text
+
+                if tag.startswith(TOMBOY_CAT_PREFIX):
+                    category = tag.replace(TOMBOY_CAT_PREFIX, '')
+                else:
+                    tags.append(tag)
+
+        self.tags = tags
+        self.category = category
+
+    def get_dates(self):
+        # record dates
+        self.create_date = self.root.find(el('create-date')).text
+        self.last_change_date = self.root.find(el('last-change-date')).text
+
+    def get_title(self):
+        title = self.root.find(el('title')).text
+        fixed_title = fix_title(title)
+        if fixed_title != title:
+            print('Adjusted title: %r -> %r' % (title, fixed_title))
+        self.basename = fixed_title.replace(' ', '_')
+        self.title = title
+
+    def get_content(self):
+        contentTag = self.root.find(el('text')).find(el('note-content'))
+        content = MarkupSegment.from_element(contentTag)
+        content.merge_tags()
+        content.convert_monospace()
+        content = content.split_lines()
+        content.prune_empty()
+        content.format_title(self.title)
+        content.convert_headings()
+        content.check_parents()  # sanity check
+        self.content = content
+
+
+def fix_title(title):
+    """Fix the title so that it is valid for Zim"""
+    # based on regex from zim.notebook.page
+    # we add colon to the invalid characters because Zim uses it as a separator
+    nonword_start = re.compile(r'^[_\W]+')
+    bad_chars = re.compile(r'[\\:?#/*"<>|%\t\n\r]+')
+    title = nonword_start.sub('', title)
+    title = bad_chars.sub('~', title)
+    return title
+
+
+class NoteConverter:
+
+    def __init__(self):
+        self.titles = {}
+        self.basenames = {}
+
+    def run(self):
+        self.get_options()
+        self.get_input()
+        self.get_output()
+        self.scan_notes()
+        self.index_notes()
+        self.fix_links()
+        self.convert_notes()
+
+    def get_options(self):
+        parser = OptionParser(usage='%prog [options]')
+        parser.add_option("-i", "--input", help="Input directory")
+        parser.add_option("-o", "--output", help="Output directory")
+        parser.add_option("--no-broken", help="Don't carry over broken links", action="store_true")
+        parser.add_option("-f", "--force", help="Overwrite output directory if present",
+                          action="store_true")
+        opts, args = parser.parse_args()
+
+        if args:
+            parser.error('This command takes no arguments')
+
+        self.opts = opts
+
+    def get_input(self):
+        """Figure out where we're reading the input from"""
+        default = self.find_tomboy_dir()
+        if not self.opts.input:
+            path = input("path to gnote/tomboy notes directory (blank for %s): " % default)
+            path = path.rstrip()
+        else:
+            path = self.opts.input
+        if not path:
+            path = default
+        path = os.path.realpath(os.path.expanduser(path))
+        if os.path.isdir(path):
+            print("Reading gnote/tomboy directory: ", path)
+            files = glob.glob(path + "/*.note")
+        elif os.path.isfile(path):
+            print("Reading single note file: ", path)
+            files = [path]
+        else:
+            raise ValueError('invalid path: %s' % path)
+
+        if len(files) == 0:
+            print("no note files.")
+            sys.exit()
+        self.input = path
+        self.files = files
+
+    def find_tomboy_dir(self):
+        to_look = [
+                "~/.local/share/tomboy",
+                "~/.local/share/gnote",
+                "~/.tomboy",  # older location
+                ]
+        for path in to_look:
+            path = os.path.expanduser(path)
+            if os.path.exists(path):
+                return path
+        # otherwise
+        return "."
+
+    def get_output(self):
+        if not self.opts.output:
+            zimnotes = input("Path to output directory (blank for current directory): ")
+            zimnotes = zimnotes.rstrip()
+        else:
+            zimnotes = self.opts.output
+        if zimnotes == "":
+            # current
+            zimnotes = "."
+        zimnotes = os.path.realpath(os.path.expanduser(zimnotes))
+        if not zimnotes[-1] == "/":
+            zimnotes += "/"
+        if zimnotes == self.input:
+            # avoid overlapping directory
+            zimnotes += "zim/"
+        print("Output directory: ", zimnotes)
+        if not os.path.exists(zimnotes):
+            os.makedirs(zimnotes)
+        elif os.listdir(zimnotes):
+            print("WARNING: directory is not empty: %s" % zimnotes)
+            if not self.opts.force:
+                answer = input("Continue [Yes/no]? ").lower()
+                if answer != "" and answer[0] != "y":
+                    sys.exit()
+        self.zimnotes = zimnotes
+
+    def scan_notes(self):
+        notes = []
+        for path in self.files:
+            note = Note(path)
+            if 'system:template' in note.tags:
+                print('Skipping template: %s' % path)
+                continue
+            notes.append(note)
+
+        self.notes = notes
+        print('Scanned %i notes' % len(self.notes))
+
+    def index_notes(self):
+        titles = {}
+        basenames = {}
+        error = False
+        for note in self.notes:
+            self.get_unique_title(note, (titles, basenames))
+            key = note.basename.lower()
+            if key in basenames:
+                # should not happen
+                print('Error: duplicate basename: %(basename)s' % note)
+                error = True
+            else:
+                basenames[key] = note
+            key = note.title.lower()
+            if key in titles:
+                # should not happen
+                print('Error: duplicate title: %(title)s' % note)
+                error = True
+            else:
+                titles[key] = note
+        if error:
+            raise Exception('Errors scanning notes')
+        self.titles = titles
+        self.basenames = basenames
+
+    def get_unique_title(self, note, indexes):
+        orig = title = note.title
+
+        def check_unique():
+            for key in title.lower(), fixed.lower(), basename.lower():
+                for index in indexes:
+                    if key in index:
+                        print('Warning: index conflict: %r' % key)
+                        return False
+            return True
+
+        for n in count():
+            fixed = fix_title(title)
+            basename = fixed.replace(' ', '_')
+            if check_unique():
+                break
+            else:
+                title = "%s [%i]" % (orig, n)
+        if orig != title:
+            print('Adjusted title for uniqueness: %r -> %r' % (orig, title))
+        note.title = title
+        note.basename = basename
+
+    def fix_links(self):
+        """Attempt to fix targets for internal links"""
+        for note in self.notes:
+            for link in note.content.filter_contents('link*'):
+                ltype = link.tag.ttype.split(':', 2)[1]
+                if ltype not in ('internal', 'broken'):
+                    continue
+                orig = link.text()
+                target = self.get_link(orig)
+                if not target:
+                    if ltype == 'internal':
+                        print("Warning: BROKEN LINK: %r from %s (%s)" % (orig, note.path, note.title))
+                    elif self.opts.no_broken:
+                        # indicate that we should omit this broken link
+                        link.tag.attrib['unlink'] = True
+                link.tag.attrib['target'] = target or orig
+
+    def convert_notes(self):
+        # do the thing
+        for note in self.notes:
+            self.convert_note(note)
+        print("Converted %i notes" % len(self.notes))
+
+    def convert_note(self, note):
+        folder = note.category or ''
+        basename = note.basename
+        dirname = self.zimnotes
+        if folder:
+            dirname = "%s/%s" % (self.zimnotes, folder)
+            if not os.path.exists(dirname):
+                print("mkdir %s" % dirname)
+                os.mkdir(dirname)
+        outname = "%s/%s.txt" % (dirname, basename)
+        with open(outname, "w") as fo:
+            fo.write('Content-Type: text/x-zim-wiki\n')
+            fo.write('Wiki-Format: zim 0.6\n')
+            fo.write('Creation-Date: %s\n' % note.create_date)
+            fo.write('\n')
+            fo.write("%s\n" % ''.join(note.content.iter_markup()))
+        try:
+            # set file timestamp
+            ts = parse_date(note.last_change_date).timestamp()
+            os.utime(outname, (ts, ts))
+        except Exception:
+            print('Warning: unable to set timestamp for note: %s' % outname)
+
+    def get_link(self, target, mode="internal"):
+        note = self.get_note(target)
+        if note:
+            folder = note.category or ''
+            if folder:
+                target = "%s:%s" % (folder, note.basename)
+            else:
+                target = note.basename
+            return target
+        else:
+            return None
+
+    def get_note(self, target):
+        target = target.lower()
+        note = self.titles.get(target) or self.basenames.get(target)
+        return note
+
+
+def main():
+    nc = NoteConverter()
+    nc.run()
+
+
+if __name__ == '__main__':
+    main()
