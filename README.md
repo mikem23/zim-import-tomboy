@@ -6,10 +6,10 @@ Key features:
 
 * accurately translates *most* Tomboy markup
 * will fix links marked as "broken" if the target exists
-* uses zim-safe filenames and adjusts links accordingly
-* zim-style markup in the Tomboy note is masked using zero width spaces
+* uses Zim-safe file names and adjusts links accordingly
+* Zim-style markup in the Tomboy note is masked using zero width spaces
 * Tomboy categories are mapped to Zim folders, with links adjusted accordingly
-* Broken links can ben optionally dropped
+* Broken links can be optionally dropped
 
 
 Markup notes:
